@@ -1,19 +1,21 @@
 <?php
 // =================== VIP REFER BOT (PHP + SQLite) ===================
-// Works on Render Web Service with Telegram Webhook.
+// Render Web Service + Telegram Webhook
 //
 // ENV on Render (required):
 // BOT_TOKEN, ADMIN_ID, FORCE_JOIN_1, FORCE_JOIN_2
 //
+// Your bot username: @VIPREFEEER_BOT
+//
 // Features:
 // ✅ Force join 2 groups/channels + Verify button
 // ✅ Unique referral link for EVERY user: https://t.me/<botusername>?start=<user_id>
-// ✅ Referral points: +1 to referrer when new user starts with ref link (only once per new user)
+// ✅ Referral points: User A gets +1 ONLY AFTER User B verifies successfully (one-time)
 // ✅ Stats, Withdraw: costs 3 points, deduct only 3 each time, gives 1 coupon code
 // ✅ Admin panel: visible ONLY to admin, admin can add coupons + check stock
 //
 // IMPORTANT:
-// - Your bot username has "_" so referral link is shown using HTML mode (never breaks).
+// - Username has "_" so referral link is shown using HTML mode (never breaks).
 // - For channels, bot must be ADMIN in those channels for getChatMember to work.
 // ====================================================================
 
@@ -46,11 +48,14 @@ function init_db($pdo) {
     awaiting_coupons INTEGER NOT NULL DEFAULT 0,
     created_at TEXT DEFAULT CURRENT_TIMESTAMP
   )");
+
+  // Stores which referrer is attached to each new user (only 1-time)
   $pdo->exec("CREATE TABLE IF NOT EXISTS referrals(
     new_user_id INTEGER PRIMARY KEY,
     referrer_id INTEGER NOT NULL,
     created_at TEXT DEFAULT CURRENT_TIMESTAMP
   )");
+
   $pdo->exec("CREATE TABLE IF NOT EXISTS coupons(
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     code TEXT NOT NULL UNIQUE,
@@ -58,11 +63,19 @@ function init_db($pdo) {
     used_by INTEGER,
     used_at TEXT
   )");
+
   // cache bot username
   $pdo->exec("CREATE TABLE IF NOT EXISTS kv(
     k TEXT PRIMARY KEY,
     v TEXT,
     updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+  )");
+
+  // to ensure referrer is rewarded ONLY after verify, and ONLY once
+  $pdo->exec("CREATE TABLE IF NOT EXISTS verify_rewards(
+    user_id INTEGER PRIMARY KEY,
+    rewarded INTEGER NOT NULL DEFAULT 0,
+    rewarded_at TEXT
   )");
 }
 $pdo = db($dbPath);
@@ -235,7 +248,7 @@ function deductPoints($pdo, $user_id, $n) {
   return true;
 }
 function recordReferral($pdo, $new_user_id, $referrer_id) {
-  // Only first start counts for referral points
+  // store link between new user and referrer only once
   try {
     $st = $pdo->prepare("INSERT INTO referrals(new_user_id, referrer_id) VALUES(?, ?)");
     $st->execute([$new_user_id, $referrer_id]);
@@ -278,6 +291,38 @@ function takeCoupon($pdo, $user_id) {
   return $code;
 }
 
+// ---- Verify reward system: reward referrer ONLY after verify (one-time) ----
+function isVerifyRewarded($pdo, $user_id) {
+  $st = $pdo->prepare("SELECT rewarded FROM verify_rewards WHERE user_id=?");
+  $st->execute([$user_id]);
+  $row = $st->fetch(PDO::FETCH_ASSOC);
+  return $row ? (intval($row["rewarded"]) === 1) : false;
+}
+function markVerifyRewarded($pdo, $user_id) {
+  $st = $pdo->prepare("INSERT INTO verify_rewards(user_id, rewarded, rewarded_at)
+    VALUES(?, 1, CURRENT_TIMESTAMP)
+    ON CONFLICT(user_id) DO UPDATE SET rewarded=1, rewarded_at=CURRENT_TIMESTAMP");
+  $st->execute([$user_id]);
+}
+function rewardReferrerAfterVerify($pdo, $new_user_id) {
+  if (isVerifyRewarded($pdo, $new_user_id)) return;
+
+  $u = getUser($pdo, $new_user_id);
+  if (!$u) return;
+
+  $referrer_id = intval($u["referred_by"] ?? 0);
+  if ($referrer_id <= 0) {
+    markVerifyRewarded($pdo, $new_user_id);
+    return;
+  }
+
+  // Give point only once per new user (uses referrals table as lock)
+  if (recordReferral($pdo, $new_user_id, $referrer_id)) {
+    addPoints($pdo, $referrer_id, 1);
+  }
+  markVerifyRewarded($pdo, $new_user_id);
+}
+
 // ---------------- Text ----------------
 function welcomeText() { return "🎉WELCOME TO VIP REFER BOT"; }
 function joinGateText() {
@@ -301,7 +346,7 @@ if (isset($update["message"])) {
   $user_id = $msg["from"]["id"];
   $text = $msg["text"] ?? "";
 
-  // /start + referral
+  // /start + referral param
   if (strpos($text, "/start") === 0) {
     $referrer_id = null;
     $parts = explode(" ", $text, 2);
@@ -310,22 +355,22 @@ if (isset($update["message"])) {
       if ($referrer_id === $user_id) $referrer_id = null;
     }
 
+    // Save referred_by for new user, but DO NOT reward yet.
     ensureUser($pdo, $user_id, $referrer_id);
 
-    // add 1 point to referrer only first time
-    if ($referrer_id) {
-      if (recordReferral($pdo, $user_id, $referrer_id)) {
-        addPoints($pdo, $referrer_id, 1);
-      }
-    }
-
+    // If already verified, just show menu
     if (!checkForceJoin($user_id)) {
       setVerified($pdo, $user_id, 0);
       sendMessage($chat_id, joinGateText(), joinKeyboard());
       http_response_code(200); echo "OK"; exit;
     }
 
+    // Verified immediately (if already joined groups)
     setVerified($pdo, $user_id, 1);
+
+    // Reward referrer only AFTER verify success (this is verify success)
+    rewardReferrerAfterVerify($pdo, $user_id);
+
     sendMessage($chat_id, welcomeText(), mainMenu($user_id));
     http_response_code(200); echo "OK"; exit;
   }
@@ -387,14 +432,19 @@ if (isset($update["callback_query"])) {
   $u = getUser($pdo, $user_id);
   $verified = $u ? intval($u["verified"]) : 0;
 
-  // verify
+  // verify button
   if ($data === "verify") {
     if (!checkForceJoin($user_id)) {
       setVerified($pdo, $user_id, 0);
       editMessage($chat_id, $message_id, "❌ Not verified yet.\n\nJoin both groups then click ✅ Verify.", joinKeyboard());
       http_response_code(200); echo "OK"; exit;
     }
+
     setVerified($pdo, $user_id, 1);
+
+    // ✅ reward referrer ONLY now (after verify success)
+    rewardReferrerAfterVerify($pdo, $user_id);
+
     editMessage($chat_id, $message_id, welcomeText(), mainMenu($user_id));
     http_response_code(200); echo "OK"; exit;
   }
@@ -419,17 +469,16 @@ if (isset($update["callback_query"])) {
     http_response_code(200); echo "OK"; exit;
   }
 
-  // ✅ UNIQUE referral link for every user (user_id is unique)
+  // ✅ Unique referral link per user (user_id is unique)
   if ($data === "mylink") {
     $botUsername = getBotUsername($pdo);
     if (!$botUsername) {
       editMessage($chat_id, $message_id, "❌ Bot username not found.\nSet username in @BotFather, then try again.", mainMenu($user_id));
       http_response_code(200); echo "OK"; exit;
     }
-    $link = "https://t.me/{$botUsername}?start={$user_id}";
 
-    // Use HTML so "_" never breaks the message
-    $text = "<b>🔗 Your Referral Link</b>\n\n<code>" . html($link) . "</code>\n\nShare this link. When someone starts the bot using it, you get <b>+1 point</b>.";
+    $link = "https://t.me/{$botUsername}?start={$user_id}";
+    $text = "<b>🔗 Your Referral Link</b>\n\n<code>" . html($link) . "</code>\n\nShare this link. When someone verifies successfully, you get <b>+1 point</b>.";
     editMessage($chat_id, $message_id, $text, mainMenu($user_id), "HTML");
     http_response_code(200); echo "OK"; exit;
   }
@@ -462,7 +511,7 @@ if (isset($update["callback_query"])) {
 
     $code = takeCoupon($pdo, $user_id);
     if (!$code) {
-      addPoints($pdo, $user_id, $WITHDRAW_COST); // refund
+      addPoints($pdo, $user_id, $WITHDRAW_COST);
       editMessage($chat_id, $message_id, "⚠️ No coupons available right now. Please try later.", mainMenu($user_id));
       http_response_code(200); echo "OK"; exit;
     }
@@ -507,8 +556,3 @@ if (isset($update["callback_query"])) {
 
 http_response_code(200);
 echo "OK";
-
-
-http_response_code(200);
-echo "OK";
-
