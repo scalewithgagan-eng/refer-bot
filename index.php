@@ -1,18 +1,27 @@
 <?php
 // =================== VIP REFER BOT (PHP + SQLite) ===================
-// Render Web Service + Webhook
+// Works on Render Web Service with Telegram Webhook.
 //
-// ENV on Render:
+// ENV on Render (required):
 // BOT_TOKEN, ADMIN_ID, FORCE_JOIN_1, FORCE_JOIN_2
 //
-// Referral link auto-detects bot username via getMe() and caches in DB.
+// Features:
+// ✅ Force join 2 groups/channels + Verify button
+// ✅ Unique referral link for EVERY user: https://t.me/<botusername>?start=<user_id>
+// ✅ Referral points: +1 to referrer when new user starts with ref link (only once per new user)
+// ✅ Stats, Withdraw: costs 3 points, deduct only 3 each time, gives 1 coupon code
+// ✅ Admin panel: visible ONLY to admin, admin can add coupons + check stock
+//
+// IMPORTANT:
+// - Your bot username has "_" so referral link is shown using HTML mode (never breaks).
+// - For channels, bot must be ADMIN in those channels for getChatMember to work.
 // ====================================================================
 
-// ---------- CONFIG ----------
+// ---------------- CONFIG ----------------
 $BOT_TOKEN    = trim((string)getenv("BOT_TOKEN"));
 $ADMIN_ID     = intval(getenv("ADMIN_ID"));
-$FORCE_JOIN_1 = trim((string)getenv("FORCE_JOIN_1"));  // @username or -100...
-$FORCE_JOIN_2 = trim((string)getenv("FORCE_JOIN_2"));  // @username or -100...
+$FORCE_JOIN_1 = trim((string)getenv("FORCE_JOIN_1"));  // @username OR -100xxxxxxxxxx
+$FORCE_JOIN_2 = trim((string)getenv("FORCE_JOIN_2"));  // @username OR -100xxxxxxxxxx
 $WITHDRAW_COST = 3;
 
 if ($BOT_TOKEN === "") { http_response_code(500); echo "Missing BOT_TOKEN"; exit; }
@@ -21,7 +30,7 @@ if ($ADMIN_ID <= 0)    { http_response_code(500); echo "Missing ADMIN_ID"; exit;
 $API = "https://api.telegram.org/bot{$BOT_TOKEN}/";
 $dbPath = __DIR__ . "/bot.sqlite";
 
-// ---------- DB ----------
+// ---------------- DB ----------------
 function db($dbPath) {
   $pdo = new PDO("sqlite:" . $dbPath);
   $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
@@ -49,18 +58,17 @@ function init_db($pdo) {
     used_by INTEGER,
     used_at TEXT
   )");
-  // cache table for bot username
+  // cache bot username
   $pdo->exec("CREATE TABLE IF NOT EXISTS kv(
     k TEXT PRIMARY KEY,
     v TEXT,
     updated_at TEXT DEFAULT CURRENT_TIMESTAMP
   )");
 }
-
 $pdo = db($dbPath);
 init_db($pdo);
 
-// ---------- Telegram HTTP ----------
+// ---------------- Telegram HTTP ----------------
 function tg($method, $data) {
   global $API;
   $ch = curl_init($API . $method);
@@ -78,32 +86,35 @@ function tg($method, $data) {
 function answerCallback($callback_query_id) {
   tg("answerCallbackQuery", ["callback_query_id" => $callback_query_id]);
 }
-function sendMessage($chat_id, $text, $reply_markup = null, $parse_mode = "Markdown") {
+function sendMessage($chat_id, $text, $reply_markup = null, $parse_mode = null) {
   $data = [
     "chat_id" => $chat_id,
     "text" => $text,
-    "parse_mode" => $parse_mode,
     "disable_web_page_preview" => true
   ];
+  if ($parse_mode) $data["parse_mode"] = $parse_mode;
   if ($reply_markup) $data["reply_markup"] = json_encode($reply_markup);
   return tg("sendMessage", $data);
 }
-function editMessage($chat_id, $message_id, $text, $reply_markup = null, $parse_mode = "Markdown") {
+function editMessage($chat_id, $message_id, $text, $reply_markup = null, $parse_mode = null) {
   $data = [
     "chat_id" => $chat_id,
     "message_id" => $message_id,
     "text" => $text,
-    "parse_mode" => $parse_mode,
     "disable_web_page_preview" => true
   ];
+  if ($parse_mode) $data["parse_mode"] = $parse_mode;
   if ($reply_markup) $data["reply_markup"] = json_encode($reply_markup);
   return tg("editMessageText", $data);
 }
 function getChatMember($chat_id, $user_id) {
   return tg("getChatMember", ["chat_id" => $chat_id, "user_id" => $user_id]);
 }
+function html($s) {
+  return htmlspecialchars((string)$s, ENT_QUOTES | ENT_SUBSTITUTE, "UTF-8");
+}
 
-// ---------- Bot username cache ----------
+// ---------------- Bot username cache (auto) ----------------
 function kv_get($pdo, $k) {
   $st = $pdo->prepare("SELECT v FROM kv WHERE k=?");
   $st->execute([$k]);
@@ -128,7 +139,7 @@ function getBotUsername($pdo) {
   return null;
 }
 
-// ---------- Force-Join Check ----------
+// ---------------- Force Join ----------------
 function isJoined($chat, $user_id) {
   $chat = trim((string)$chat);
   if ($chat === "") return true;
@@ -144,7 +155,7 @@ function checkForceJoin($user_id) {
   return isJoined($FORCE_JOIN_1, $user_id) && isJoined($FORCE_JOIN_2, $user_id);
 }
 
-// ---------- UI ----------
+// ---------------- UI ----------------
 function buildJoinUrlFromChat($chat) {
   $chat = trim((string)$chat);
   if ($chat === "") return null;
@@ -154,15 +165,21 @@ function buildJoinUrlFromChat($chat) {
 function joinKeyboard() {
   global $FORCE_JOIN_1, $FORCE_JOIN_2;
   $rows = [];
+
   $u1 = buildJoinUrlFromChat($FORCE_JOIN_1);
   if ($u1) $rows[] = [["text" => "📌 Join Group 1", "url" => $u1]];
+
   $u2 = buildJoinUrlFromChat($FORCE_JOIN_2);
   if ($u2) $rows[] = [["text" => "📌 Join Group 2", "url" => $u2]];
+
   $rows[] = [["text" => "✅ Verify", "callback_data" => "verify"]];
   return ["inline_keyboard" => $rows];
 }
-function mainMenu() {
-  return ["inline_keyboard" => [
+
+// ✅ Admin button ONLY visible to admin
+function mainMenu($user_id) {
+  global $ADMIN_ID;
+  $keyboard = [
     [
       ["text" => "📊 Stats", "callback_data" => "stats"],
       ["text" => "🎁 Withdraw", "callback_data" => "withdraw"]
@@ -171,10 +188,13 @@ function mainMenu() {
       ["text" => "🔗 My Link", "callback_data" => "mylink"],
       ["text" => "❓ Help", "callback_data" => "help"]
     ],
-    [
-      ["text" => "🛠 Admin", "callback_data" => "admin"]
-    ],
-  ]];
+  ];
+  if ($user_id == $ADMIN_ID) {
+    $keyboard[] = [
+      ["text" => "🛠 Admin Panel", "callback_data" => "admin"]
+    ];
+  }
+  return ["inline_keyboard" => $keyboard];
 }
 function adminMenu() {
   return ["inline_keyboard" => [
@@ -188,7 +208,7 @@ function adminMenu() {
   ]];
 }
 
-// ---------- DB helpers ----------
+// ---------------- DB helpers ----------------
 function ensureUser($pdo, $user_id, $referred_by = null) {
   $st = $pdo->prepare("INSERT OR IGNORE INTO users(user_id, referred_by) VALUES(?, ?)");
   $st->execute([$user_id, $referred_by]);
@@ -215,6 +235,7 @@ function deductPoints($pdo, $user_id, $n) {
   return true;
 }
 function recordReferral($pdo, $new_user_id, $referrer_id) {
+  // Only first start counts for referral points
   try {
     $st = $pdo->prepare("INSERT INTO referrals(new_user_id, referrer_id) VALUES(?, ?)");
     $st->execute([$new_user_id, $referrer_id]);
@@ -257,23 +278,23 @@ function takeCoupon($pdo, $user_id) {
   return $code;
 }
 
-// ---------- Text helpers ----------
-function welcomeText() { return "🎉*WELCOME TO VIP REFER BOT*"; }
+// ---------------- Text ----------------
+function welcomeText() { return "🎉WELCOME TO VIP REFER BOT"; }
 function joinGateText() {
   global $FORCE_JOIN_1, $FORCE_JOIN_2;
   $note = "";
   if (($FORCE_JOIN_1 && $FORCE_JOIN_1[0] !== "@") || ($FORCE_JOIN_2 && $FORCE_JOIN_2[0] !== "@")) {
-    $note = "\n\nℹ️ Join links are hidden because you used numeric chat IDs. Join manually, then click ✅ Verify.";
+    $note = "\n\nJoin links hidden (numeric chat id used). Join manually then click ✅ Verify.";
   }
-  return "🔒 *Join both groups to use the bot.*\n\nAfter joining, click ✅ *Verify*." . $note;
+  return "🔒 Join both groups to use the bot.\n\nAfter joining, click ✅ Verify." . $note;
 }
 
-// =================== WEBHOOK INPUT ===================
+// ================= WEBHOOK INPUT =================
 $raw = file_get_contents("php://input");
 $update = json_decode($raw, true);
 if (!$update) { http_response_code(200); echo "OK"; exit; }
 
-// =================== MESSAGE ===================
+// ================= MESSAGE =================
 if (isset($update["message"])) {
   $msg = $update["message"];
   $chat_id = $msg["chat"]["id"];
@@ -291,10 +312,11 @@ if (isset($update["message"])) {
 
     ensureUser($pdo, $user_id, $referrer_id);
 
-    // +1 point only first time
+    // add 1 point to referrer only first time
     if ($referrer_id) {
-      $recorded = recordReferral($pdo, $user_id, $referrer_id);
-      if ($recorded) addPoints($pdo, $referrer_id, 1);
+      if (recordReferral($pdo, $user_id, $referrer_id)) {
+        addPoints($pdo, $referrer_id, 1);
+      }
     }
 
     if (!checkForceJoin($user_id)) {
@@ -304,28 +326,28 @@ if (isset($update["message"])) {
     }
 
     setVerified($pdo, $user_id, 1);
-    sendMessage($chat_id, welcomeText(), mainMenu());
+    sendMessage($chat_id, welcomeText(), mainMenu($user_id));
     http_response_code(200); echo "OK"; exit;
   }
 
-  // /admin
+  // /admin command (only admin)
   if ($text === "/admin") {
     if ($user_id != $ADMIN_ID) {
-      sendMessage($chat_id, "❌ You are not admin.", mainMenu());
+      sendMessage($chat_id, "❌ You are not admin.", mainMenu($user_id));
       http_response_code(200); echo "OK"; exit;
     }
     sendMessage($chat_id, "🛠 Admin Panel", adminMenu());
     http_response_code(200); echo "OK"; exit;
   }
 
-  // /cancel
+  // /cancel (admin coupon add mode)
   if ($text === "/cancel") {
     setAwaitingCoupons($pdo, $user_id, 0);
-    sendMessage($chat_id, "✅ Cancelled.", mainMenu());
+    sendMessage($chat_id, "✅ Cancelled.", mainMenu($user_id));
     http_response_code(200); echo "OK"; exit;
   }
 
-  // Admin adding coupons
+  // Admin adding coupons (awaiting mode)
   $u = getUser($pdo, $user_id);
   if ($u && intval($u["awaiting_coupons"]) === 1 && $user_id == $ADMIN_ID) {
     $lines = preg_split("/\r\n|\n|\r/", $text);
@@ -336,7 +358,7 @@ if (isset($update["message"])) {
       if (addCoupon($pdo, $code)) $added++; else $skipped++;
     }
     $stock = couponStock($pdo);
-    sendMessage($chat_id, "✅ Added: *{$added}*\n⚠️ Skipped: *{$skipped}*\n📦 Stock: *{$stock}*", adminMenu());
+    sendMessage($chat_id, "✅ Added: {$added}\n⚠️ Skipped: {$skipped}\n📦 Stock: {$stock}", adminMenu());
     http_response_code(200); echo "OK"; exit;
   }
 
@@ -345,13 +367,13 @@ if (isset($update["message"])) {
   if (!$u || intval($u["verified"]) !== 1) {
     sendMessage($chat_id, joinGateText(), joinKeyboard());
   } else {
-    sendMessage($chat_id, welcomeText(), mainMenu());
+    sendMessage($chat_id, welcomeText(), mainMenu($user_id));
   }
 
   http_response_code(200); echo "OK"; exit;
 }
 
-// =================== CALLBACK QUERY ===================
+// ================= CALLBACK QUERY =================
 if (isset($update["callback_query"])) {
   $cq = $update["callback_query"];
   $data = $cq["data"];
@@ -365,131 +387,118 @@ if (isset($update["callback_query"])) {
   $u = getUser($pdo, $user_id);
   $verified = $u ? intval($u["verified"]) : 0;
 
+  // verify
   if ($data === "verify") {
     if (!checkForceJoin($user_id)) {
       setVerified($pdo, $user_id, 0);
-      editMessage($chat_id, $message_id, "❌ Not verified yet.\n\nJoin both groups, then click ✅ Verify again.", joinKeyboard(), "Markdown");
+      editMessage($chat_id, $message_id, "❌ Not verified yet.\n\nJoin both groups then click ✅ Verify.", joinKeyboard());
       http_response_code(200); echo "OK"; exit;
     }
     setVerified($pdo, $user_id, 1);
-    editMessage($chat_id, $message_id, welcomeText(), mainMenu(), "Markdown");
+    editMessage($chat_id, $message_id, welcomeText(), mainMenu($user_id));
     http_response_code(200); echo "OK"; exit;
   }
 
+  // block other buttons if not verified
   if ($verified !== 1) {
-    editMessage($chat_id, $message_id, "🔒 Please join both groups first, then click ✅ Verify.", joinKeyboard(), "Markdown");
+    editMessage($chat_id, $message_id, "🔒 Please join both groups first, then click ✅ Verify.", joinKeyboard());
     http_response_code(200); echo "OK"; exit;
   }
 
   if ($data === "back") {
-    editMessage($chat_id, $message_id, welcomeText(), mainMenu(), "Markdown");
+    editMessage($chat_id, $message_id, welcomeText(), mainMenu($user_id));
     http_response_code(200); echo "OK"; exit;
   }
 
   if ($data === "stats") {
     $points = $u ? intval($u["points"]) : 0;
     editMessage($chat_id, $message_id,
-      "📊 *Your Stats*\n\n⭐ Points: *{$points}*\n🎁 Need *{$WITHDRAW_COST}* points for 1 code.",
-      mainMenu(),
-      "Markdown"
+      "📊 Your Stats\n\n⭐ Points: {$points}\n🎁 Need {$WITHDRAW_COST} points for 1 code.",
+      mainMenu($user_id)
     );
     http_response_code(200); echo "OK"; exit;
   }
 
+  // ✅ UNIQUE referral link for every user (user_id is unique)
   if ($data === "mylink") {
     $botUsername = getBotUsername($pdo);
     if (!$botUsername) {
-      $msg = "❌ Bot username not found.\n\nSet a username in @BotFather, then send /start again.";
-      editMessage($chat_id, $message_id, $msg, mainMenu(), "Markdown");
+      editMessage($chat_id, $message_id, "❌ Bot username not found.\nSet username in @BotFather, then try again.", mainMenu($user_id));
       http_response_code(200); echo "OK"; exit;
     }
     $link = "https://t.me/{$botUsername}?start={$user_id}";
-    editMessage($chat_id, $message_id,
-      "🔗 *Your Referral Link*\n\n{$link}\n\nShare this link. When someone starts the bot using it, you get *+1 point*.",
-      mainMenu(),
-      "Markdown"
-    );
+
+    // Use HTML so "_" never breaks the message
+    $text = "<b>🔗 Your Referral Link</b>\n\n<code>" . html($link) . "</code>\n\nShare this link. When someone starts the bot using it, you get <b>+1 point</b>.";
+    editMessage($chat_id, $message_id, $text, mainMenu($user_id), "HTML");
     http_response_code(200); echo "OK"; exit;
   }
 
   if ($data === "help") {
     editMessage($chat_id, $message_id,
-      "❓ *Help*\n\n• Join both groups and click ✅ Verify\n• Get *{$WITHDRAW_COST}* points = 1 code\n• Share your referral link to earn points\n• Withdraw deducts only *{$WITHDRAW_COST}* points each time",
-      mainMenu(),
-      "Markdown"
+      "❓ Help\n\n• Join both groups and click ✅ Verify\n• {$WITHDRAW_COST} points = 1 code\n• Share your referral link to earn points\n• Withdraw deducts only {$WITHDRAW_COST} points each time",
+      mainMenu($user_id)
     );
     http_response_code(200); echo "OK"; exit;
   }
 
   if ($data === "withdraw") {
     $points = $u ? intval($u["points"]) : 0;
-
     if ($points < $WITHDRAW_COST) {
-      editMessage($chat_id, $message_id,
-        "❌ Not enough points.\n\nYou have: *{$points}*\nNeed: *{$WITHDRAW_COST}*",
-        mainMenu(),
-        "Markdown"
-      );
+      editMessage($chat_id, $message_id, "❌ Not enough points.\n\nYou have: {$points}\nNeed: {$WITHDRAW_COST}", mainMenu($user_id));
       http_response_code(200); echo "OK"; exit;
     }
 
     $stock = couponStock($pdo);
     if ($stock <= 0) {
-      editMessage($chat_id, $message_id, "⚠️ No coupons available right now. Please try later.", mainMenu(), "Markdown");
+      editMessage($chat_id, $message_id, "⚠️ No coupons available right now. Please try later.", mainMenu($user_id));
       http_response_code(200); echo "OK"; exit;
     }
 
     if (!deductPoints($pdo, $user_id, $WITHDRAW_COST)) {
-      editMessage($chat_id, $message_id, "❌ Something went wrong. Try again.", mainMenu(), "Markdown");
+      editMessage($chat_id, $message_id, "❌ Something went wrong. Try again.", mainMenu($user_id));
       http_response_code(200); echo "OK"; exit;
     }
 
     $code = takeCoupon($pdo, $user_id);
     if (!$code) {
-      addPoints($pdo, $user_id, $WITHDRAW_COST);
-      editMessage($chat_id, $message_id, "⚠️ No coupons available right now. Please try later.", mainMenu(), "Markdown");
+      addPoints($pdo, $user_id, $WITHDRAW_COST); // refund
+      editMessage($chat_id, $message_id, "⚠️ No coupons available right now. Please try later.", mainMenu($user_id));
       http_response_code(200); echo "OK"; exit;
     }
 
-    editMessage($chat_id, $message_id,
-      "✅ Withdraw successful!\n\n🎁 Your Code: `{$code}`\n\n⭐ Deducted: *{$WITHDRAW_COST}* points",
-      mainMenu(),
-      "Markdown"
-    );
+    $text = "<b>✅ Withdraw successful!</b>\n\n🎁 Your Code: <code>" . html($code) . "</code>\n\n⭐ Deducted: <b>{$WITHDRAW_COST}</b> points";
+    editMessage($chat_id, $message_id, $text, mainMenu($user_id), "HTML");
     http_response_code(200); echo "OK"; exit;
   }
 
-  // Admin
+  // Admin panel (ONLY admin can open; and ONLY admin sees button)
   if ($data === "admin") {
     if ($user_id != $ADMIN_ID) {
-      editMessage($chat_id, $message_id, "❌ You are not admin.", mainMenu(), "Markdown");
+      editMessage($chat_id, $message_id, "❌ You are not admin.", mainMenu($user_id));
       http_response_code(200); echo "OK"; exit;
     }
-    editMessage($chat_id, $message_id, "🛠 Admin Panel", adminMenu(), "Markdown");
+    editMessage($chat_id, $message_id, "🛠 Admin Panel", adminMenu());
     http_response_code(200); echo "OK"; exit;
   }
 
   if ($data === "admin_stock") {
     if ($user_id != $ADMIN_ID) {
-      editMessage($chat_id, $message_id, "❌ You are not admin.", mainMenu(), "Markdown");
+      editMessage($chat_id, $message_id, "❌ You are not admin.", mainMenu($user_id));
       http_response_code(200); echo "OK"; exit;
     }
     $stock = couponStock($pdo);
-    editMessage($chat_id, $message_id, "📦 Unused coupons in stock: *{$stock}*", adminMenu(), "Markdown");
+    editMessage($chat_id, $message_id, "📦 Unused coupons in stock: {$stock}", adminMenu());
     http_response_code(200); echo "OK"; exit;
   }
 
   if ($data === "admin_add") {
     if ($user_id != $ADMIN_ID) {
-      editMessage($chat_id, $message_id, "❌ You are not admin.", mainMenu(), "Markdown");
+      editMessage($chat_id, $message_id, "❌ You are not admin.", mainMenu($user_id));
       http_response_code(200); echo "OK"; exit;
     }
     setAwaitingCoupons($pdo, $user_id, 1);
-    editMessage($chat_id, $message_id,
-      "➕ Send me coupons now.\n\nSend multiple codes in one message, one per line.\nType /cancel to stop.",
-      null,
-      "Markdown"
-    );
+    editMessage($chat_id, $message_id, "➕ Send coupons now (one per line).\nType /cancel to stop.");
     http_response_code(200); echo "OK"; exit;
   }
 
@@ -498,3 +507,8 @@ if (isset($update["callback_query"])) {
 
 http_response_code(200);
 echo "OK";
+
+
+http_response_code(200);
+echo "OK";
+
