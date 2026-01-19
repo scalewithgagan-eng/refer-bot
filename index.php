@@ -1,23 +1,4 @@
 <?php
-// =================== REFER BOT + JOIN VERIFY + "VERIFY NOW" WEB VERIFY ===================
-// Hosting: Render (Webhook)
-// ENV (Render):
-//   BOT_TOKEN, ADMIN_ID, FORCE_JOIN_1, FORCE_JOIN_2
-//
-// What it does:
-// 1) User clicks /start (with or without referral payload)
-// 2) Bot checks FORCE_JOIN_1 + FORCE_JOIN_2 (join verification) -> ✅ Verify button
-// 3) Then shows "Verify Yourself" screen -> ✅ Verify Now (opens web) + ✅ Check Verification
-// 4) ONLY after BOTH verifications -> main menu
-// 5) Referral points: User A gets +1 ONLY after User B completes BOTH verifications (one-time)
-// 6) Coupons: admin adds coupons -> stored in DB until redeemed -> when redeemed coupon is DELETED from stock
-// 7) Admin panel visible ONLY to ADMIN_ID
-//
-// Notes:
-// - Telegram bots cannot get true device ID. This uses a "device token" stored in Telegram in-app browser localStorage.
-// - One device token can be bound to only one Telegram account.
-// =========================================================================================
-
 ini_set('display_errors', '0');
 ini_set('log_errors', '1');
 error_reporting(E_ALL);
@@ -26,8 +7,9 @@ try {
 
 $BOT_TOKEN    = trim((string)getenv("BOT_TOKEN"));
 $ADMIN_ID     = intval(getenv("ADMIN_ID"));
-$FORCE_JOIN_1 = trim((string)getenv("FORCE_JOIN_1"));  // @username or -100...
-$FORCE_JOIN_2 = trim((string)getenv("FORCE_JOIN_2"));  // @username or -100...
+$FORCE_JOIN_1 = trim((string)getenv("FORCE_JOIN_1"));
+$FORCE_JOIN_2 = trim((string)getenv("FORCE_JOIN_2"));
+
 $WITHDRAW_COST = 3;
 $VERIFY_LINK_TTL = 1800; // 30 minutes
 
@@ -55,28 +37,25 @@ function init_db($pdo) {
     created_at TEXT DEFAULT CURRENT_TIMESTAMP
   )");
 
-  // lock: reward only once per new user
   $pdo->exec("CREATE TABLE IF NOT EXISTS referrals(
     new_user_id INTEGER PRIMARY KEY,
     referrer_id INTEGER NOT NULL,
     created_at TEXT DEFAULT CURRENT_TIMESTAMP
   )");
 
-  // Coupon stock: rows exist until redeemed; redeemed coupon is deleted
+  // coupon stock: exists until redeemed -> deleted on redeem
   $pdo->exec("CREATE TABLE IF NOT EXISTS coupons(
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     code TEXT NOT NULL UNIQUE,
     created_at TEXT DEFAULT CURRENT_TIMESTAMP
   )");
 
-  // cache (no fancy UPSERT to avoid old sqlite problems)
   $pdo->exec("CREATE TABLE IF NOT EXISTS kv(
     k TEXT PRIMARY KEY,
     v TEXT,
     updated_at TEXT DEFAULT CURRENT_TIMESTAMP
   )");
 
-  // device lock
   $pdo->exec("CREATE TABLE IF NOT EXISTS device_registry(
     device_token TEXT PRIMARY KEY,
     user_id INTEGER NOT NULL,
@@ -98,7 +77,7 @@ function html($s) { return htmlspecialchars((string)$s, ENT_QUOTES | ENT_SUBSTIT
 function baseUrl() {
   $proto = (!empty($_SERVER['HTTP_X_FORWARDED_PROTO'])) ? $_SERVER['HTTP_X_FORWARDED_PROTO'] : 'https';
   $host  = $_SERVER['HTTP_X_FORWARDED_HOST'] ?? ($_SERVER['HTTP_HOST'] ?? '');
-  $path  = $_SERVER['SCRIPT_NAME'] ?? '/';
+  $path  = $_SERVER['SCRIPT_NAME'] ?? '/index.php';
   return $proto . '://' . $host . $path;
 }
 
@@ -195,7 +174,6 @@ function checkForceJoin($user_id) {
 
 // ---------------- DB helpers ----------------
 function ensureUser($pdo, $user_id, $referred_by = null) {
-  // Only set referred_by on first insert; do not overwrite later
   $st = $pdo->prepare("INSERT OR IGNORE INTO users(user_id, referred_by) VALUES(?, ?)");
   $st->execute([$user_id, $referred_by]);
 }
@@ -252,28 +230,23 @@ function couponStock($pdo) {
   $st = $pdo->query("SELECT COUNT(*) FROM coupons");
   return intval($st->fetchColumn() ?: 0);
 }
-// Delete coupon from stock when redeemed
 function takeCoupon($pdo) {
   $pdo->beginTransaction();
   $st = $pdo->query("SELECT id, code FROM coupons ORDER BY id ASC LIMIT 1");
   $row = $st->fetch(PDO::FETCH_ASSOC);
   if (!$row) { $pdo->rollBack(); return null; }
-
   $id = intval($row["id"]);
   $code = $row["code"];
-
   $st2 = $pdo->prepare("DELETE FROM coupons WHERE id=?");
   $st2->execute([$id]);
-
   $pdo->commit();
   return $code;
 }
 
-// Reward referrer ONLY after both verifications (join + device)
+// Reward referrer only after both verifications
 function rewardReferrerIfEligible($pdo, $new_user_id) {
   $u = getUser($pdo, $new_user_id);
   if (!$u) return;
-
   if (intval($u["join_verified"]) !== 1) return;
   if (intval($u["device_verified"]) !== 1) return;
 
@@ -285,12 +258,11 @@ function rewardReferrerIfEligible($pdo, $new_user_id) {
   }
 }
 
-// Device binding
+// device bind
 function bindDeviceToken($pdo, $user_id, $device_token) {
   $device_token = trim((string)$device_token);
   if ($device_token === "") return [false, "Empty device token"];
 
-  // device already used by someone else?
   $st = $pdo->prepare("SELECT user_id FROM device_registry WHERE device_token=?");
   $st->execute([$device_token]);
   $row = $st->fetch(PDO::FETCH_ASSOC);
@@ -298,7 +270,6 @@ function bindDeviceToken($pdo, $user_id, $device_token) {
     return [false, "This device is already used on another Telegram account."];
   }
 
-  // user already bound to another device?
   $st2 = $pdo->prepare("SELECT device_token FROM user_device WHERE user_id=?");
   $st2->execute([$user_id]);
   $row2 = $st2->fetch(PDO::FETCH_ASSOC);
@@ -306,7 +277,6 @@ function bindDeviceToken($pdo, $user_id, $device_token) {
     return [false, "This Telegram account is already verified on another device."];
   }
 
-  // save
   $st3 = $pdo->prepare("INSERT OR REPLACE INTO device_registry(device_token, user_id, created_at) VALUES(?, ?, CURRENT_TIMESTAMP)");
   $st3->execute([$device_token, $user_id]);
 
@@ -377,12 +347,9 @@ function adminMenu() {
   ]];
 }
 
-// =====================================================================
-// WEB VERIFY ROUTES: handled on GET/POST using ?action=verify / verify_submit
-// =====================================================================
+// ================= WEB VERIFY ROUTES =================
 $action = $_GET["action"] ?? null;
 
-// Serve verify page
 if ($_SERVER["REQUEST_METHOD"] === "GET" && $action === "verify") {
   $uid = intval($_GET["uid"] ?? 0);
   $ts  = intval($_GET["ts"] ?? 0);
@@ -472,7 +439,6 @@ document.getElementById("btn").onclick = async () => {
   exit;
 }
 
-// Receive verify submit
 if ($_SERVER["REQUEST_METHOD"] === "POST" && $action === "verify_submit") {
   $uid = intval($_POST["uid"] ?? 0);
   $ts  = intval($_POST["ts"] ?? 0);
@@ -493,9 +459,7 @@ if ($_SERVER["REQUEST_METHOD"] === "POST" && $action === "verify_submit") {
   exit;
 }
 
-// =====================================================================
-// TELEGRAM WEBHOOK (POST JSON)
-// =====================================================================
+// ================= TELEGRAM WEBHOOK =================
 $raw = file_get_contents("php://input");
 $update = json_decode($raw, true);
 if (!$update) { http_response_code(200); echo "OK"; exit; }
@@ -507,12 +471,11 @@ if (isset($update["message"])) {
   $user_id = $msg["from"]["id"];
   $text = $msg["text"] ?? "";
 
-  // Robust /start parsing (fixes /start@BotName and payload)
-  if (preg_match('/^\/start(?:@[\w_]+)?(?:\s+(.+))?$/', trim($text), $m)) {
-    $payload = isset($m[1]) ? trim($m[1]) : "";
+  // /start with or without payload (works with /start@botname too)
+  if (preg_match('/^\/start(?:@[\w_]+)?(?:\s+(.+))?$/', trim((string)$text), $m)) {
+    $payload = isset($m[1]) ? trim((string)$m[1]) : "";
     $referrer_id = null;
 
-    // accept only digits as referral id
     if ($payload !== "" && preg_match('/^\d+$/', $payload)) {
       $referrer_id = intval($payload);
       if ($referrer_id === $user_id) $referrer_id = null;
@@ -520,7 +483,6 @@ if (isset($update["message"])) {
 
     ensureUser($pdo, $user_id, $referrer_id);
 
-    // Step 1: join verify
     if (!checkForceJoin($user_id)) {
       setJoinVerified($pdo, $user_id, 0);
       sendMessage($chat_id, joinGateText(), joinKeyboard());
@@ -528,7 +490,6 @@ if (isset($update["message"])) {
     }
     setJoinVerified($pdo, $user_id, 1);
 
-    // Step 2: device verify
     $u = getUser($pdo, $user_id);
     if (!$u || intval($u["device_verified"]) !== 1) {
       $ts = time();
@@ -538,14 +499,12 @@ if (isset($update["message"])) {
       http_response_code(200); echo "OK"; exit;
     }
 
-    // Both verified -> reward + menu
     rewardReferrerIfEligible($pdo, $user_id);
     sendMessage($chat_id, welcomeText(), mainMenu($user_id));
     http_response_code(200); echo "OK"; exit;
   }
 
-  // /admin
-  if (trim($text) === "/admin") {
+  if (trim((string)$text) === "/admin") {
     if ($user_id != $ADMIN_ID) {
       sendMessage($chat_id, "❌ You are not admin.", mainMenu($user_id));
       http_response_code(200); echo "OK"; exit;
@@ -554,16 +513,206 @@ if (isset($update["message"])) {
     http_response_code(200); echo "OK"; exit;
   }
 
-  // /cancel coupon add mode
-  if (trim($text) === "/cancel") {
+  if (trim((string)$text) === "/cancel") {
     setAwaitingCoupons($pdo, $user_id, 0);
     sendMessage($chat_id, "✅ Cancelled.", mainMenu($user_id));
     http_response_code(200); echo "OK"; exit;
   }
 
-  // Admin adding coupons (awaiting mode)
+  // Admin adding coupons (awaiting mode) — FIXED COMPLETE BLOCK
   $u = getUser($pdo, $user_id);
   if ($u && intval($u["awaiting_coupons"]) === 1 && $user_id == $ADMIN_ID) {
-    $lines = preg_split("/\r\n|\n|\r/", $text);
-    $added = 0; $skipped = 0;
-    foreach ($lines as $
+    $lines = preg_split("/\r\n|\n|\r/", (string)$text);
+    $added = 0;
+    $skipped = 0;
+
+    foreach ($lines as $line) {
+      $code = trim((string)$line);
+      if ($code === "") continue;
+      if (addCoupon($pdo, $code)) $added++; else $skipped++;
+    }
+
+    $stock = couponStock($pdo);
+    sendMessage($chat_id, "✅ Added: {$added}\n⚠️ Skipped: {$skipped}\n📦 Stock: {$stock}", adminMenu());
+    http_response_code(200); echo "OK"; exit;
+  }
+
+  // default
+  $u = getUser($pdo, $user_id);
+  if (!$u || intval($u["join_verified"]) !== 1) {
+    sendMessage($chat_id, joinGateText(), joinKeyboard());
+  } else if (intval($u["device_verified"]) !== 1) {
+    $ts = time(); $sig = makeSig($user_id, $ts);
+    $verifyUrl = baseUrl() . "?action=verify&uid={$user_id}&ts={$ts}&sig={$sig}";
+    sendMessage($chat_id, "Next: *Verify Yourself*", deviceVerifyKeyboard($verifyUrl), "Markdown");
+  } else {
+    sendMessage($chat_id, welcomeText(), mainMenu($user_id));
+  }
+
+  http_response_code(200); echo "OK"; exit;
+}
+
+// ---------------- CALLBACKS ----------------
+if (isset($update["callback_query"])) {
+  $cq = $update["callback_query"];
+  $data = $cq["data"];
+  $user_id = $cq["from"]["id"];
+  $chat_id = $cq["message"]["chat"]["id"];
+  $message_id = $cq["message"]["message_id"];
+  $callback_id = $cq["id"];
+
+  answerCallback($callback_id);
+
+  $u = getUser($pdo, $user_id);
+  $join_ok = $u ? intval($u["join_verified"]) : 0;
+  $dev_ok  = $u ? intval($u["device_verified"]) : 0;
+
+  if ($data === "verify_join") {
+    if (!checkForceJoin($user_id)) {
+      setJoinVerified($pdo, $user_id, 0);
+      editMessage($chat_id, $message_id, "❌ Verification failed.\nJoin both chats then click ✅ Verify again.", joinKeyboard());
+      http_response_code(200); echo "OK"; exit;
+    }
+    setJoinVerified($pdo, $user_id, 1);
+
+    $ts = time(); $sig = makeSig($user_id, $ts);
+    $verifyUrl = baseUrl() . "?action=verify&uid={$user_id}&ts={$ts}&sig={$sig}";
+    editMessage($chat_id, $message_id, "✅ Channel join verified!\n\nNext: *Verify Yourself*", deviceVerifyKeyboard($verifyUrl), "Markdown");
+    http_response_code(200); echo "OK"; exit;
+  }
+
+  if ($data === "check_device") {
+    $u = getUser($pdo, $user_id);
+    $join_ok = $u ? intval($u["join_verified"]) : 0;
+    $dev_ok  = $u ? intval($u["device_verified"]) : 0;
+
+    if ($join_ok !== 1) {
+      editMessage($chat_id, $message_id, "❌ First verify join.\nJoin both chats then click ✅ Verify.", joinKeyboard());
+      http_response_code(200); echo "OK"; exit;
+    }
+    if ($dev_ok !== 1) {
+      $ts = time(); $sig = makeSig($user_id, $ts);
+      $verifyUrl = baseUrl() . "?action=verify&uid={$user_id}&ts={$ts}&sig={$sig}";
+      editMessage($chat_id, $message_id, "❌ Verification not completed.\nTap ✅ Verify Now then come back and press ✅ Check Verification.", deviceVerifyKeyboard($verifyUrl));
+      http_response_code(200); echo "OK"; exit;
+    }
+
+    rewardReferrerIfEligible($pdo, $user_id);
+    editMessage($chat_id, $message_id, welcomeText(), mainMenu($user_id));
+    http_response_code(200); echo "OK"; exit;
+  }
+
+  if ($join_ok !== 1) {
+    editMessage($chat_id, $message_id, "🔒 Join both chats first, then click ✅ Verify.", joinKeyboard());
+    http_response_code(200); echo "OK"; exit;
+  }
+  if ($dev_ok !== 1) {
+    $ts = time(); $sig = makeSig($user_id, $ts);
+    $verifyUrl = baseUrl() . "?action=verify&uid={$user_id}&ts={$ts}&sig={$sig}";
+    editMessage($chat_id, $message_id, "Next: *Verify Yourself*", deviceVerifyKeyboard($verifyUrl), "Markdown");
+    http_response_code(200); echo "OK"; exit;
+  }
+
+  if ($data === "back") {
+    editMessage($chat_id, $message_id, welcomeText(), mainMenu($user_id));
+    http_response_code(200); echo "OK"; exit;
+  }
+
+  if ($data === "stats") {
+    $points = $u ? intval($u["points"]) : 0;
+    editMessage($chat_id, $message_id, "📊 Your Stats\n\n⭐ Points: {$points}\n🎁 Need {$WITHDRAW_COST} points for 1 code.", mainMenu($user_id));
+    http_response_code(200); echo "OK"; exit;
+  }
+
+  if ($data === "mylink") {
+    $botUsername = getBotUsername($pdo);
+    if (!$botUsername) {
+      editMessage($chat_id, $message_id, "❌ Bot username not found (check token).", mainMenu($user_id));
+      http_response_code(200); echo "OK"; exit;
+    }
+    $link = "https://t.me/{$botUsername}?start={$user_id}";
+    $text = "<b>🔗 Your Referral Link</b>\n\n<code>" . html($link) . "</code>\n\nWhen someone verifies successfully, you get <b>+1 point</b>.";
+    editMessage($chat_id, $message_id, $text, mainMenu($user_id), "HTML");
+    http_response_code(200); echo "OK"; exit;
+  }
+
+  if ($data === "help") {
+    editMessage($chat_id, $message_id,
+      "❓ Help\n\n• Join both chats and verify\n• Then complete Verify Yourself (web)\n• {$WITHDRAW_COST} points = 1 code\n• Withdraw deducts only {$WITHDRAW_COST} points each time",
+      mainMenu($user_id)
+    );
+    http_response_code(200); echo "OK"; exit;
+  }
+
+  if ($data === "withdraw") {
+    $points = $u ? intval($u["points"]) : 0;
+    if ($points < $WITHDRAW_COST) {
+      editMessage($chat_id, $message_id, "❌ Not enough points.\n\nYou have: {$points}\nNeed: {$WITHDRAW_COST}", mainMenu($user_id));
+      http_response_code(200); echo "OK"; exit;
+    }
+
+    $stock = couponStock($pdo);
+    if ($stock <= 0) {
+      editMessage($chat_id, $message_id, "⚠️ No coupons available right now. Please try later.", mainMenu($user_id));
+      http_response_code(200); echo "OK"; exit;
+    }
+
+    if (!deductPoints($pdo, $user_id, $WITHDRAW_COST)) {
+      editMessage($chat_id, $message_id, "❌ Something went wrong. Try again.", mainMenu($user_id));
+      http_response_code(200); echo "OK"; exit;
+    }
+
+    $code = takeCoupon($pdo);
+    if (!$code) {
+      addPoints($pdo, $user_id, $WITHDRAW_COST);
+      editMessage($chat_id, $message_id, "⚠️ No coupons available right now. Please try later.", mainMenu($user_id));
+      http_response_code(200); echo "OK"; exit;
+    }
+
+    $text = "<b>✅ Withdraw successful!</b>\n\n🎁 Your Code: <code>" . html($code) . "</code>\n\n⭐ Deducted: <b>{$WITHDRAW_COST}</b> points";
+    editMessage($chat_id, $message_id, $text, mainMenu($user_id), "HTML");
+    http_response_code(200); echo "OK"; exit;
+  }
+
+  if ($data === "admin") {
+    if ($user_id != $ADMIN_ID) {
+      editMessage($chat_id, $message_id, "❌ You are not admin.", mainMenu($user_id));
+      http_response_code(200); echo "OK"; exit;
+    }
+    editMessage($chat_id, $message_id, "🛠 Admin Panel", adminMenu());
+    http_response_code(200); echo "OK"; exit;
+  }
+
+  if ($data === "admin_stock") {
+    if ($user_id != $ADMIN_ID) {
+      editMessage($chat_id, $message_id, "❌ You are not admin.", mainMenu($user_id));
+      http_response_code(200); echo "OK"; exit;
+    }
+    $stock = couponStock($pdo);
+    editMessage($chat_id, $message_id, "📦 Coupons in stock: {$stock}", adminMenu());
+    http_response_code(200); echo "OK"; exit;
+  }
+
+  if ($data === "admin_add") {
+    if ($user_id != $ADMIN_ID) {
+      editMessage($chat_id, $message_id, "❌ You are not admin.", mainMenu($user_id));
+      http_response_code(200); echo "OK"; exit;
+    }
+    setAwaitingCoupons($pdo, $user_id, 1);
+    editMessage($chat_id, $message_id, "➕ Send coupons now (one per line).\nType /cancel to stop.");
+    http_response_code(200); echo "OK"; exit;
+  }
+
+  http_response_code(200); echo "OK"; exit;
+}
+
+http_response_code(200);
+echo "OK";
+exit;
+
+} catch (Throwable $e) {
+  error_log("BOT ERROR: " . $e->getMessage() . " @ " . $e->getFile() . ":" . $e->getLine());
+  http_response_code(200);
+  echo "OK";
+  exit;
+}
